@@ -525,9 +525,23 @@
                         <h2 class="text-xl font-bold flex items-center gap-2"><span class="text-2xl">🕒</span> Histórico no Servidor</h2>
                         <p class="text-sm text-slate-400 mt-1">Seus envios, links e códigos armazenados na nuvem (Supabase).</p>
                     </div>
-                    <button id="btn-refresh-history" class="text-xs text-purple-300 hover:text-white bg-purple-900/40 hover:bg-purple-800 transition-colors border border-purple-500/40 px-4 py-2 rounded-lg font-bold flex items-center gap-1.5">
-                        🔄 Atualizar Lista
-                    </button>
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <button id="btn-delete-selected-history" class="hidden text-xs text-red-300 hover:text-white bg-red-950/60 hover:bg-red-900 transition-colors border border-red-500/40 px-3 py-2 rounded-lg font-bold flex items-center gap-1.5">
+                            🗑️ Apagar Selecionados (<span id="selected-hist-count">0</span>)
+                        </button>
+                        <button id="btn-clear-all-history" class="text-xs text-red-300 hover:text-white bg-red-950/40 hover:bg-red-900 transition-colors border border-red-500/40 px-3 py-2 rounded-lg font-bold flex items-center gap-1.5">
+                            ⚠️ Limpar Tudo
+                        </button>
+                        <button id="btn-refresh-history" class="text-xs text-purple-300 hover:text-white bg-purple-900/40 hover:bg-purple-800 transition-colors border border-purple-500/40 px-4 py-2 rounded-lg font-bold flex items-center gap-1.5">
+                            🔄 Atualizar Lista
+                        </button>
+                    </div>
+                </div>
+
+                <div class="flex items-center gap-2 px-1">
+                    <label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none">
+                        <input type="checkbox" id="select-all-history" class="accent-purple-500 w-4 h-4 cursor-pointer"> Selecionar Todos
+                    </label>
                 </div>
                 
                 <div id="history-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 overflow-y-auto pr-2 max-h-[600px]">
@@ -722,9 +736,13 @@
         } catch (e) { console.warn("Supabase não pôde ser inicializado:", e); }
 
         // --- SISTEMA DE HISTÓRICO NO SERVIDOR (SUPABASE) ---
+        const selectedHistoryIds = new Set();
+
         async function renderHistoryFromServer() {
             const list = document.getElementById('history-list');
             list.innerHTML = '<div class="col-span-full text-center text-slate-400 py-10 animate-pulse">Carregando histórico do servidor...</div>';
+            selectedHistoryIds.clear();
+            updateHistorySelectionUI();
             
             if (!supabaseClient) {
                 list.innerHTML = '<div class="col-span-full text-center text-red-400 py-10">Conexão com o Supabase indisponível.</div>';
@@ -761,15 +779,19 @@
                     else if (name.endsWith('_canvas.json')) icon = '🎨';
                     else if (name.match(/\.(svg|png|jpg|jpeg)$/i)) icon = '🖼️';
 
+                    const isChecked = selectedHistoryIds.has(item.id) ? 'checked' : '';
+
                     card.innerHTML = `
                         <div class="flex items-start justify-between gap-2 border-b border-slate-700/50 pb-2">
                             <div class="flex items-center gap-3 overflow-hidden">
+                                <input type="checkbox" class="hist-item-chk accent-purple-500 w-4 h-4 cursor-pointer flex-shrink-0" data-id="${item.id}" ${isChecked}>
                                 <span class="text-2xl bg-slate-800 p-2 rounded-lg">${icon}</span>
                                 <div class="flex flex-col overflow-hidden">
                                     <span class="font-bold text-sm text-white truncate w-full pr-2" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
                                     <span class="text-[10px] text-slate-400">${item.created_at ? new Date(item.created_at).toLocaleString() : 'Recente'}</span>
                                 </div>
                             </div>
+                            <button class="text-slate-500 hover:text-red-400 p-1 transition-colors rounded hover:bg-red-500/10 flex-shrink-0" onclick="deleteHistoryItem('${item.id}', '${item.file_path}')" title="Apagar item">🗑️</button>
                         </div>
                         
                         <div class="flex items-center gap-4 pt-1">
@@ -787,6 +809,14 @@
                             </div>
                         </div>
                     `;
+                    
+                    const chk = card.querySelector('.hist-item-chk');
+                    chk.addEventListener('change', (e) => {
+                        if (e.target.checked) selectedHistoryIds.add(item.id);
+                        else selectedHistoryIds.delete(item.id);
+                        updateHistorySelectionUI();
+                    });
+
                     list.appendChild(card);
                     
                     setTimeout(() => {
@@ -803,6 +833,103 @@
                 list.innerHTML = `<div class="col-span-full text-center text-red-400 py-10">Erro ao carregar do servidor: ${err.message}</div>`;
             }
         }
+
+        function updateHistorySelectionUI() {
+            const countSpan = document.getElementById('selected-hist-count');
+            const delBtn = document.getElementById('btn-delete-selected-history');
+            countSpan.textContent = selectedHistoryIds.size;
+            if (selectedHistoryIds.size > 0) {
+                delBtn.classList.remove('hidden');
+            } else {
+                delBtn.classList.add('hidden');
+            }
+        }
+
+        document.getElementById('select-all-history').addEventListener('change', (e) => {
+            const checkboxes = document.querySelectorAll('.hist-item-chk');
+            checkboxes.forEach(chk => {
+                chk.checked = e.target.checked;
+                const id = chk.getAttribute('data-id');
+                if (e.target.checked) selectedHistoryIds.add(id);
+                else selectedHistoryIds.delete(id);
+            });
+            updateHistorySelectionUI();
+        });
+
+        window.deleteHistoryItem = async function(id, filePath) {
+            if (!confirm("Deseja realmente apagar este item do histórico e da nuvem?")) return;
+            showLoader("Apagando...", "Removendo arquivo e registro...");
+            try {
+                if (filePath) {
+                    await supabaseClient.storage.from("files").remove([filePath]);
+                }
+                const { error } = await supabaseClient.from("transfers").delete().eq("id", id);
+                if (error) throw error;
+                hideLoader();
+                showToast("Item apagado com sucesso!");
+                renderHistoryFromServer();
+            } catch (err) {
+                hideLoader();
+                showToast("Erro ao apagar: " + err.message, true);
+            }
+        };
+
+        document.getElementById('btn-delete-selected-history').addEventListener('click', async () => {
+            if (selectedHistoryIds.size === 0) return;
+            if (!confirm(`Deseja apagar os ${selectedHistoryIds.size} itens selecionados?`)) return;
+            
+            showLoader("Apagando Selecionados", "Removendo registros...");
+            try {
+                const idsArray = Array.from(selectedHistoryIds);
+                // Buscar file paths para remover do storage
+                const { data: itemsToRemove, error: fetchErr } = await supabaseClient.from("transfers").select("id, file_path").in("id", idsArray);
+                if (fetchErr) throw fetchErr;
+
+                if (itemsToRemove && itemsToRemove.length > 0) {
+                    const paths = itemsToRemove.map(it => it.file_path).filter(Boolean);
+                    if (paths.length > 0) {
+                        await supabaseClient.storage.from("files").remove(paths);
+                    }
+                }
+
+                const { error } = await supabaseClient.from("transfers").delete().in("id", idsArray);
+                if (error) throw error;
+
+                hideLoader();
+                showToast("Itens selecionados apagados com sucesso!");
+                renderHistoryFromServer();
+            } catch (err) {
+                hideLoader();
+                showToast("Erro ao apagar selecionados: " + err.message, true);
+            }
+        });
+
+        document.getElementById('btn-clear-all-history').addEventListener('click', async () => {
+            if (!confirm("ATENÇÃO: Deseja apagar TODO o histórico e arquivos do servidor? Esta ação não pode ser desfeita.")) return;
+            showLoader("Limpando Histórico", "Removendo tudo...");
+            try {
+                const { data: allItems, error: fetchErr } = await supabaseClient.from("transfers").select("file_path");
+                if (fetchErr) throw fetchErr;
+
+                if (allItems && allItems.length > 0) {
+                    const paths = allItems.map(it => it.file_path).filter(Boolean);
+                    if (paths.length > 0) {
+                        await supabaseClient.storage.from("files").remove(paths);
+                    }
+                }
+
+                // Deletar todas as linhas da tabela transfers
+                const { error } = await supabaseClient.from("transfers").delete().not("id", "is", null);
+                if (error) throw error;
+
+                hideLoader();
+                showToast("Histórico limpo com sucesso!");
+                renderHistoryFromServer();
+            } catch (err) {
+                hideLoader();
+                showToast("Erro ao limpar histórico: " + err.message, true);
+            }
+        });
 
         document.getElementById('btn-refresh-history').addEventListener('click', renderHistoryFromServer);
 
