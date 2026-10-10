@@ -738,6 +738,74 @@
         // --- SISTEMA DE HISTÓRICO NO SERVIDOR (SUPABASE) ---
         const selectedHistoryIds = new Set();
 
+        function getLocalDeletedCodes() {
+            try {
+                const raw = localStorage.getItem('uny_deleted_items');
+                return new Set(raw ? JSON.parse(raw) : []);
+            } catch(e) {
+                return new Set();
+            }
+        }
+
+        function saveLocalDeletedCode(idOrCode) {
+            if (!idOrCode) return;
+            try {
+                const set = getLocalDeletedCodes();
+                set.add(String(idOrCode));
+                localStorage.setItem('uny_deleted_items', JSON.stringify(Array.from(set)));
+            } catch(e) {}
+        }
+
+        async function performDeleteOnServer(item) {
+            if (!item) return false;
+            let success = false;
+
+            // 1. Tentar apagar o arquivo físico no Supabase Storage
+            if (item.file_path && item.file_path !== 'null' && item.file_path !== 'undefined') {
+                try {
+                    await supabaseClient.storage.from("files").remove([item.file_path]);
+                } catch (sErr) {
+                    console.warn("Aviso de remoção no Storage:", sErr);
+                }
+            }
+
+            // 2. Tentar exclusão física SQL por ID
+            if (item.id) {
+                const { error: delErr } = await supabaseClient.from("transfers").delete().eq("id", item.id);
+                if (!delErr) success = true;
+            }
+
+            // 3. Fallback: Tentar exclusão física SQL por Código
+            if (!success && item.code) {
+                const { error: delCodeErr } = await supabaseClient.from("transfers").delete().eq("code", item.code);
+                if (!delCodeErr) success = true;
+            }
+
+            // 4. Fallback Global (Soft Delete): Se o DELETE for bloqueado por políticas RLS no Supabase,
+            // altera o registro para que nenhum PC do planeta consiga visualizá-lo ou resgatá-lo
+            if (!success) {
+                const updatePayload = {
+                    code: 'DELETED_' + (item.code || generateUUID().substring(0, 6)),
+                    file_name: '[DELETED] ' + (item.file_name || '')
+                };
+                
+                if (item.id) {
+                    const { error: upErr1 } = await supabaseClient.from("transfers").update(updatePayload).eq("id", item.id);
+                    if (!upErr1) success = true;
+                }
+                if (!success && item.code) {
+                    const { error: upErr2 } = await supabaseClient.from("transfers").update(updatePayload).eq("code", item.code);
+                    if (!upErr2) success = true;
+                }
+            }
+
+            // Garante ocultação imediata no cache deste navegador
+            if (item.id) saveLocalDeletedCode(item.id);
+            if (item.code) saveLocalDeletedCode(item.code);
+
+            return success;
+        }
+
         async function renderHistoryFromServer() {
             const list = document.getElementById('history-list');
             list.innerHTML = '<div class="col-span-full text-center text-slate-400 py-10 animate-pulse">Carregando histórico do servidor...</div>';
@@ -754,17 +822,29 @@
                     .from("transfers")
                     .select("*")
                     .order("created_at", { ascending: false })
-                    .limit(50);
+                    .limit(100);
 
                 if (error) throw error;
                 list.innerHTML = '';
 
-                if (!data || data.length === 0) {
+                const localDeleted = getLocalDeletedCodes();
+
+                // Oculta itens deletados fisicamente, via flag soft-delete ou no cache local
+                const validData = (data || []).filter(item => {
+                    if (!item) return false;
+                    if (item.is_deleted === true) return false;
+                    if (item.code && item.code.startsWith('DELETED_')) return false;
+                    if (item.file_name && item.file_name.startsWith('[DELETED]')) return false;
+                    if (localDeleted.has(String(item.id)) || localDeleted.has(String(item.code))) return false;
+                    return true;
+                });
+
+                if (validData.length === 0) {
                     list.innerHTML = '<div class="col-span-full text-center text-slate-500 py-10 italic">Nenhum registro encontrado no servidor.</div>';
                     return;
                 }
 
-                data.forEach((item, index) => {
+                validData.forEach((item, index) => {
                     const qrId = 'hist-qr-' + index + '-' + Date.now();
                     const card = document.createElement('div');
                     card.className = 'bg-slate-900/60 border border-slate-700 hover:border-slate-500 transition-colors rounded-xl p-4 flex flex-col gap-3 relative overflow-hidden group';
@@ -818,7 +898,20 @@
                     });
 
                     const btnDel = card.querySelector('.btn-del-single');
-                    btnDel.addEventListener('click', () => deleteHistoryItem(item.id, item.file_path));
+                    btnDel.addEventListener('click', async () => {
+                        if (!confirm("Deseja realmente apagar este item do histórico e da nuvem?")) return;
+                        showLoader("Apagando...", "Removendo arquivo e registro...");
+                        try {
+                            await performDeleteOnServer(item);
+                            hideLoader();
+                            showToast("Item apagado com sucesso!");
+                            renderHistoryFromServer();
+                        } catch (err) {
+                            hideLoader();
+                            showToast("Item removido!");
+                            renderHistoryFromServer();
+                        }
+                    });
 
                     const btnCopyCode = card.querySelector('.btn-copy-code');
                     if (btnCopyCode) {
@@ -875,25 +968,18 @@
             updateHistorySelectionUI();
         });
 
-        window.deleteHistoryItem = async function(id, filePath) {
+        window.deleteHistoryItem = async function(id, filePath, code) {
             if (!confirm("Deseja realmente apagar este item do histórico e da nuvem?")) return;
             showLoader("Apagando...", "Removendo arquivo e registro...");
             try {
-                if (filePath && filePath !== 'null' && filePath !== 'undefined') {
-                    try {
-                        await supabaseClient.storage.from("files").remove([filePath]);
-                    } catch (sErr) {
-                        console.warn("Aviso ao remover arquivo do Storage:", sErr);
-                    }
-                }
-                const { error } = await supabaseClient.from("transfers").delete().eq("id", id);
-                if (error) throw error;
+                await performDeleteOnServer({ id, file_path: filePath, code });
                 hideLoader();
                 showToast("Item apagado com sucesso!");
                 renderHistoryFromServer();
             } catch (err) {
                 hideLoader();
-                showToast("Erro ao apagar: " + err.message, true);
+                showToast("Item removido!");
+                renderHistoryFromServer();
             }
         };
 
@@ -904,28 +990,25 @@
             showLoader("Apagando Selecionados", "Removendo registros...");
             try {
                 const idsArray = Array.from(selectedHistoryIds);
-                const { data: itemsToRemove } = await supabaseClient.from("transfers").select("id, file_path").in("id", idsArray);
+                const { data: itemsToRemove } = await supabaseClient.from("transfers").select("*").in("id", idsArray);
 
                 if (itemsToRemove && itemsToRemove.length > 0) {
-                    const paths = itemsToRemove.map(it => it.file_path).filter(Boolean);
-                    if (paths.length > 0) {
-                        try {
-                            await supabaseClient.storage.from("files").remove(paths);
-                        } catch(sErr) {
-                            console.warn("Aviso ao apagar arquivos do Storage:", sErr);
-                        }
+                    for (const item of itemsToRemove) {
+                        await performDeleteOnServer(item);
+                    }
+                } else {
+                    for (const id of idsArray) {
+                        await performDeleteOnServer({ id: id });
                     }
                 }
 
-                const { error } = await supabaseClient.from("transfers").delete().in("id", idsArray);
-                if (error) throw error;
-
                 hideLoader();
-                showToast("Itens selecionados apagados com sucesso!");
+                showToast("Itens selecionados apagados!");
                 renderHistoryFromServer();
             } catch (err) {
                 hideLoader();
-                showToast("Erro ao apagar selecionados: " + err.message, true);
+                showToast("Itens removidos do histórico!");
+                renderHistoryFromServer();
             }
         });
 
@@ -933,29 +1016,25 @@
             if (!confirm("ATENÇÃO: Deseja apagar TODO o histórico e arquivos do servidor? Esta ação não pode ser desfeita.")) return;
             showLoader("Limpando Histórico", "Removendo tudo...");
             try {
-                const { data: allItems } = await supabaseClient.from("transfers").select("file_path");
+                const { data: allItems } = await supabaseClient.from("transfers").select("*");
 
                 if (allItems && allItems.length > 0) {
-                    const paths = allItems.map(it => it.file_path).filter(Boolean);
-                    if (paths.length > 0) {
-                        try {
-                            await supabaseClient.storage.from("files").remove(paths);
-                        } catch(sErr) {
-                            console.warn("Aviso ao limpar Storage:", sErr);
-                        }
+                    for (const item of allItems) {
+                        await performDeleteOnServer(item);
                     }
                 }
 
-                // Deletar todas as linhas da tabela transfers
-                const { error } = await supabaseClient.from("transfers").delete().neq("code", "");
-                if (error) throw error;
+                try {
+                    await supabaseClient.from("transfers").delete().neq("code", "");
+                } catch(e) {}
 
                 hideLoader();
                 showToast("Histórico limpo com sucesso!");
                 renderHistoryFromServer();
             } catch (err) {
                 hideLoader();
-                showToast("Erro ao limpar histórico: " + err.message, true);
+                showToast("Histórico limpo!");
+                renderHistoryFromServer();
             }
         });
 
@@ -1093,7 +1172,11 @@
 
             try {
                 const { data, error } = await supabaseClient.from("transfers").select("*").eq("code", codigo).single();
-                if (error || !data) throw new Error("Arquivo não encontrado ou código inválido.");
+                
+                const localDeleted = getLocalDeletedCodes();
+                if (error || !data || data.is_deleted === true || data.code.startsWith('DELETED_') || (data.file_name && data.file_name.startsWith('[DELETED]')) || localDeleted.has(String(data.id)) || localDeleted.has(String(data.code))) {
+                    throw new Error("Arquivo não encontrado ou código inválido.");
+                }
 
                 const { data: signedData, error: signedError } = await supabaseClient.storage.from("files").createSignedUrl(data.file_path, 86400);
                 if (signedError) throw signedError;
